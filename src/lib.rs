@@ -17,16 +17,21 @@ use graph::{builder::build_graph, executor::execute_graph};
 
 mod graph;
 
-pub fn morsel_exec(
+pub fn morsel_exec<F>(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
-) -> Result<SendableRecordBatchStream> {
+    thread_hook: F,
+) -> Result<SendableRecordBatchStream>
+where
+    F: FnOnce() + Send + 'static,
+{
     let plan = ensure_single_output(plan);
     let (graph, output) = build_graph(plan, context)?;
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_captured = Arc::clone(&cancel);
     let handle = std::thread::spawn(move || {
+        thread_hook();
         execute_graph(graph, cancel_captured);
     });
     let output = Box::pin(ExecStream {
