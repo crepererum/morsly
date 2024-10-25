@@ -2,7 +2,7 @@ use std::{
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll},
@@ -29,7 +29,10 @@ pub(crate) fn build_graph(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
 ) -> Result<(Graph, SendableRecordBatchStream)> {
-    let mut builder = GraphBuilder::default();
+    let mut builder = GraphBuilder {
+        nodes: vec![],
+        notify: Arc::new(AtomicU32::new(0)),
+    };
     let (tx, rx) = async_channel::unbounded();
     builder.convert(None, &plan, &context, vec![tx])?;
 
@@ -39,14 +42,16 @@ pub(crate) fn build_graph(
             .into_iter()
             .map(|opt| opt.expect("all nodes converted"))
             .collect(),
+        notify: builder.notify,
     };
     let output = Box::pin(ReceiverStream::new(rx, plan.schema()));
     Ok((graph, output))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct GraphBuilder {
     nodes: Vec<Option<Node>>,
+    notify: Arc<AtomicU32>,
 }
 
 impl GraphBuilder {
@@ -65,7 +70,7 @@ impl GraphBuilder {
 
         // convert children
         let mut receivers = vec![];
-        let can_run = Arc::new(AtomicBool::new(true));  // start with true to poll at least once
+        let can_run = Arc::new(AtomicBool::new(true)); // start with true to poll at least once
         for (idx, child) in children.iter().enumerate() {
             let partition_count = child.output_partitioning().partition_count();
             let mut senders = Vec::with_capacity(partition_count);
@@ -119,6 +124,7 @@ impl GraphBuilder {
                 .execute(partition, Arc::clone(context))
                 .map_err(|e| e.context(format!("execute partition {partition} of {plan:?}")))?;
             let parent_can_run = parent.as_ref().map(|p| Arc::clone(&p.1));
+            let notify = Arc::clone(&self.notify);
             fut_group.insert(async move {
                 let mut stream = stream;
 
@@ -136,6 +142,10 @@ impl GraphBuilder {
                             // TODO(crepererum): technically we can rely on the waker to do that
                             if let Some(parent_can_run) = &parent_can_run {
                                 parent_can_run.store(true, Ordering::SeqCst);
+
+                                // modify counter AFTER setting flags
+                                notify.fetch_add(1, Ordering::SeqCst);
+                                atomic_wait::wake_all(notify.as_ref());
                             }
                         }
                     }

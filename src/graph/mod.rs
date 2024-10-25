@@ -1,6 +1,9 @@
 use std::{
     pin::Pin,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        Arc,
+    },
 };
 
 use futures::future::FusedFuture;
@@ -52,4 +55,5 @@ impl std::fmt::Debug for Node {
 #[derive(Debug)]
 pub(crate) struct Graph {
     nodes: Vec<Node>,
+    notify: Arc<AtomicU32>,
 }
