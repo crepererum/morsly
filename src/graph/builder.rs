@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
@@ -23,7 +24,7 @@ use datafusion::{
 use futures::{FutureExt, Stream, StreamExt};
 use futures_concurrency::future::FutureGroup;
 
-use super::{Graph, Node, NodeId};
+use super::{Graph, Node, NodeFut, NodeId};
 
 pub(crate) fn build_graph(
     plan: Arc<dyn ExecutionPlan>,
@@ -115,16 +116,43 @@ impl GraphBuilder {
         };
 
         // build driving future
+        let fut = self.build_future(
+            parent.as_ref().map(|p| Arc::clone(&p.1)),
+            plan,
+            context,
+            senders,
+        )?;
+
+        // build node
+        self.nodes[node_id.get()] = Some(Node {
+            parent: parent.map(|p| p.0),
+            fut,
+            can_run,
+        });
+
+        Ok(())
+    }
+
+    fn build_future(
+        &mut self,
+        parent_can_run: Option<Arc<AtomicBool>>,
+        plan: Arc<dyn ExecutionPlan>,
+        context: &Arc<TaskContext>,
+        senders: Vec<async_channel::Sender<Result<RecordBatch>>>,
+    ) -> Result<NodeFut> {
         let partition_count = plan.output_partitioning().partition_count();
         assert_eq!(partition_count, senders.len());
+
+        // group of futures that poll outputs and send it to the `senders`, i.e. towards the parents (or the final output)
         let mut fut_group = FutureGroup::with_capacity(partition_count);
         for (partition, sender) in (0..partition_count).zip(&senders) {
-            let sender = sender.clone();
             let stream = plan
                 .execute(partition, Arc::clone(context))
                 .map_err(|e| e.context(format!("execute partition {partition} of {plan:?}")))?;
-            let parent_can_run = parent.as_ref().map(|p| Arc::clone(&p.1));
+            let sender = sender.clone();
+            let parent_can_run = parent_can_run.clone();
             let notify = Arc::clone(&self.notify);
+
             fut_group.insert(async move {
                 let mut stream = stream;
 
@@ -152,19 +180,17 @@ impl GraphBuilder {
                 }
             });
         }
+
+        // poll all outputs at the same time
         let fut = async move {
             let mut fut_group = std::pin::pin!(fut_group);
             while fut_group.next().await.is_some() {}
         };
+
+        // convert panics to errors
         let fut = async move {
             if let Err(e) = AssertUnwindSafe(fut).catch_unwind().await {
-                let msg = if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = e.downcast_ref::<&str>() {
-                    (*s).to_owned()
-                } else {
-                    "<unknown>".to_owned()
-                };
+                let msg = format!("panic: {}", panic_payload_to_string(e));
                 for sender in senders {
                     sender
                         .send(Err(datafusion::error::DataFusionError::Execution(
@@ -176,14 +202,7 @@ impl GraphBuilder {
             }
         };
 
-        // build node
-        self.nodes[node_id.get()] = Some(Node {
-            parent: parent.map(|p| p.0),
-            fut: Box::pin(fut.fuse()),
-            can_run,
-        });
-
-        Ok(())
+        Ok(Box::pin(fut.fuse()))
     }
 }
 
@@ -312,5 +331,15 @@ impl Stream for ReceiverStream {
 impl RecordBatchStream for ReceiverStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+fn panic_payload_to_string(e: Box<dyn Any + Send>) -> String {
+    if let Some(s) = e.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = e.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else {
+        "<unknown>".to_owned()
     }
 }

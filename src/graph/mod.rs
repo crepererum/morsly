@@ -36,9 +36,11 @@ macro_rules! new_id_type {
 
 new_id_type!(NodeId);
 
+pub(crate) type NodeFut = Pin<Box<dyn FusedFuture<Output = ()> + Send + 'static>>;
+
 pub(crate) struct Node {
     parent: Option<NodeId>,
-    fut: Pin<Box<dyn FusedFuture<Output = ()> + Send + 'static>>,
+    fut: NodeFut,
     can_run: Arc<AtomicBool>,
 }
 
