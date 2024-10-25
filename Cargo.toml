@@ -1,0 +1,10 @@
+[package]
+name = "morsly"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-channel = "2.3.1"
+datafusion = { git = "https://github.com/influxdata/arrow-datafusion.git", rev = "0c0a52d85f0e5e9a455f8b782f3c33f918cd182b" }
+futures = "0.3.31"
+futures-concurrency = "7.6.2"
