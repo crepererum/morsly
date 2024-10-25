@@ -7,20 +7,30 @@ use std::{
 };
 
 use futures::{task::ArcWake, FutureExt};
+use log::debug;
 
 use super::{Graph, Node, NodeId};
 
 pub(crate) fn execute_graph(graph: Graph, cancel: Arc<AtomicBool>) {
+    debug!("execution started");
     let mut graph = graph;
     let Some(mut next_id) = find_next_node(&graph, None) else {
+        debug!("nothing to run!");
         return;
     };
 
-    while !cancel.load(Ordering::SeqCst) {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            debug!("execution cancelled");
+            return;
+        }
+
+        debug!("execute node: {}", next_id);
         execute_node(&mut graph.nodes[next_id.get()]);
 
         next_id = match find_next_node(&graph, Some(next_id)) {
             None => {
+                debug!("execution finished");
                 return;
             }
             Some(id) => id,

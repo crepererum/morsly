@@ -1,4 +1,5 @@
 use std::{
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,10 +10,14 @@ use std::{
 
 use datafusion::{
     arrow::{array::RecordBatch, datatypes::SchemaRef},
+    common::Statistics,
+    config::ConfigOptions,
     error::Result,
     execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext},
+    physical_expr::LexRequirement,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+        metrics::MetricsSet, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        ExecutionPlanProperties, PlanProperties,
     },
 };
 use futures::{FutureExt, Stream, StreamExt};
@@ -60,7 +65,7 @@ impl GraphBuilder {
 
         // convert children
         let mut receivers = vec![];
-        let can_run = Arc::new(AtomicBool::new(false));
+        let can_run = Arc::new(AtomicBool::new(true));  // start with true to poll at least once
         for (idx, child) in children.iter().enumerate() {
             let partition_count = child.output_partitioning().partition_count();
             let mut senders = Vec::with_capacity(partition_count);
@@ -93,17 +98,23 @@ impl GraphBuilder {
                 .collect();
             new_children.push(Arc::new(MorselExec {
                 streams: Mutex::new(streams),
+                replaced_exec: Arc::clone(child),
             }) as _);
         }
-        let plan = Arc::clone(plan)
-            .with_new_children(new_children)
-            .map_err(|e| e.context(format!("replace children of {plan:?}")))?;
+        let plan = if new_children.is_empty() {
+            Arc::clone(plan)
+        } else {
+            Arc::clone(plan)
+                .with_new_children(new_children)
+                .map_err(|e| e.context(format!("replace children of {plan:?}")))?
+        };
 
         // build driving future
         let partition_count = plan.output_partitioning().partition_count();
         assert_eq!(partition_count, senders.len());
         let mut fut_group = FutureGroup::with_capacity(partition_count);
-        for (partition, sender) in (0..partition_count).zip(senders) {
+        for (partition, sender) in (0..partition_count).zip(&senders) {
+            let sender = sender.clone();
             let stream = plan
                 .execute(partition, Arc::clone(context))
                 .map_err(|e| e.context(format!("execute partition {partition} of {plan:?}")))?;
@@ -135,6 +146,25 @@ impl GraphBuilder {
             let mut fut_group = std::pin::pin!(fut_group);
             while fut_group.next().await.is_some() {}
         };
+        let fut = async move {
+            if let Err(e) = AssertUnwindSafe(fut).catch_unwind().await {
+                let msg = if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    (*s).to_owned()
+                } else {
+                    "<unknown>".to_owned()
+                };
+                for sender in senders {
+                    sender
+                        .send(Err(datafusion::error::DataFusionError::Execution(
+                            msg.clone(),
+                        )))
+                        .await
+                        .ok();
+                }
+            }
+        };
 
         // build node
         self.nodes[node_id.get()] = Some(Node {
@@ -149,6 +179,7 @@ impl GraphBuilder {
 
 struct MorselExec {
     streams: Mutex<Vec<Option<SendableRecordBatchStream>>>,
+    replaced_exec: Arc<dyn ExecutionPlan>,
 }
 
 impl std::fmt::Debug for MorselExec {
@@ -177,7 +208,23 @@ impl ExecutionPlan for MorselExec {
     }
 
     fn properties(&self) -> &PlanProperties {
-        unimplemented!()
+        self.replaced_exec.properties()
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.replaced_exec.required_input_distribution()
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
+        self.replaced_exec.required_input_ordering()
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        self.replaced_exec.maintains_input_order()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        self.replaced_exec.benefits_from_input_partitioning()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -191,6 +238,14 @@ impl ExecutionPlan for MorselExec {
         unimplemented!()
     }
 
+    fn repartitioned(
+        &self,
+        _target_partitions: usize,
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        unimplemented!()
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -198,6 +253,26 @@ impl ExecutionPlan for MorselExec {
     ) -> Result<SendableRecordBatchStream> {
         let mut streams = self.streams.lock().expect("not poisoned");
         Ok(streams[partition].take().expect("stream used only once"))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.replaced_exec.metrics()
+    }
+
+    fn statistics(&self) -> Result<Statistics> {
+        self.replaced_exec.statistics()
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.replaced_exec.supports_limit_pushdown()
+    }
+
+    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        unimplemented!()
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.replaced_exec.fetch()
     }
 }
 
